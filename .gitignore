@@ -4,7 +4,11 @@ __pycache__
 
 .coverage
 
+# build artifacts
 baseplate.egg-info
 build/
 dist/
+
+# thrift-generated files
 baseplate/thrift
+tests/integration/test_thrift

@@ -6,7 +6,7 @@ from __future__ import unicode_literals
 from kombu import Connection, Exchange, Queue
 from kombu.pools import Producers
 
-from thrift.TSerialization import serialize
+from thrift.util.Serializer import serialize
 
 from . import ContextFactory
 from .. import config
