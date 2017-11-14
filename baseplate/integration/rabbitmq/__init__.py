@@ -3,25 +3,28 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
+import sys
+import kombu
+
 from ... import config
 
-from thrift.TSerialization import serialize
 
-import kombu
-from kombu.pools import Producers
-from kombu.mixins import ConsumerMixin
+def connection_from_config(app_config, prefix="rabbit."):
+    assert prefix.endswith(".")
+    config_prefix = prefix[:-1]
+    cfg = config.parse_config(app_config, {
+        config_prefix: {
+            # TODO: config.Endpoint?
+            "connection_url": config.String,
+        },
+    })
+
+    url = getattr(cfg, config_prefix).connection_url
+
+    return kombu.Connection(url)
 
 
-class BaseplateConsumerBase(ConsumerMixin):
-    pass
-
-
-class BaseplateConsumerBuilder(object):
-    pass
-
-
-def queue_from_config(app_config, prefix="rabbit.", **kwargs):
-    print (app_config)
+def queue_from_config(app_config, prefix="rabbit."):
     assert prefix.endswith(".")
     config_prefix = prefix[:-1]
     # TODO: other config parameters
@@ -35,7 +38,11 @@ def queue_from_config(app_config, prefix="rabbit.", **kwargs):
 
     options = getattr(cfg, config_prefix)
     # get all prefs, prefixed with queue_ and build Queue kwargs
-    options = dict((k.replace("queue_", ""),v) for k,v in options.items() if k.startswith("queue"))
+    remapped_opts = [(k.replace("queue_", ""), v)
+                     for k, v in options.items()
+                     if k.startswith("queue")]
+
+    options = dict(remapped_opts)
     return make_queue(**options)
 
 
@@ -43,7 +50,7 @@ def make_queue(*args, **kwargs):
     return kombu.Queue(*args, **kwargs)
 
 
-def exchange_from_config(app_config, prefix="rabbit.", **kwargs):
+def exchange_from_config(app_config, prefix="rabbit."):
     assert prefix.endswith(".")
     config_prefix = prefix[:-1]
     cfg = config.parse_config(app_config, {
@@ -62,54 +69,62 @@ def make_exchange(*args, **kwargs):
     return kombu.Exchange(*args, **kwargs)
 
 
-def connection_from_config(app_config, prefix="rabbit.", **kwargs):
-    assert prefix.endswith(".")
-    config_prefix = prefix[:-1]
-    cfg = config.parse_config(app_config, {
-        config_prefix: {
-            # TODO: config.Endpoint?
-            "connection_url": config.String,
-        },
-    })
-
-    url = getattr(cfg, config_prefix).connection_url
-
-    return kombu.Connection(url)
+class MessageContext(object):
+    pass
 
 
-class RabbitMQPublisherContextFactory(ContextFactory):
-    def __init__(self, connection, max_connections=None):
-        self.connection = connection
-        self.producers = Producers(limit=max_connections)
+class BaseplateConsumer(kombu.Consumer):
+    """kombu's Consumer extension for baseplate.
 
-    def make_object_for_context(self, name, span):
-        return RabbitMQPublisher(name, span, self.connection, self.producers)
+    :param kombu.ChannelT channel: The connection/channel to use for this
+        consumer.
+    :param baseplate.core.Baseplate baseplate: The baseplate instance for your
+        application.
+
+    """
+    def __init__(self, channel, baseplate, **kwargs):
+        self.baseplate = baseplate
+        super(BaseplateConsumer, self).__init__(channel, **kwargs)
+
+    def receive(self, body, message):
+        context = MessageContext()
+        context.trace = self.baseplate.make_server_span(
+            context,
+            # TODO: Name needs to be passed from outside?
+            name="TODO",
+            # TODO: trace_info
+            # trace_info=trace_info,
+        )
+
+        # TODO: Add message's headers to trace
+        context.trace.start()
+
+        try:
+            for callback in self.callbacks:
+                callback(body, message, context)
+        except:
+            context.trace.finish(exc_info=sys.exc_info())
+            raise
+        else:
+            context.trace.finish()
 
 
-class RabbitMQPublisher(object):
-    def __init__(self, name, span, connection, producers):
-        self.name = name
-        self.span = span
-        self.connection = connection
-        self.producers = producers
+class BaseplateConsumerFactory(object):
+    """
+    Consumer factory class for injecting dependencies into BaseplateConsumer
+        during application construction.
+    """
+    def __init__(self, handler, baseplate):
+        self.handler = handler
+        self.__callbacks = handler.get_callbacks()
+        assert self.__callbacks, "At least one callback must be specified"
+        self.baseplate = baseplate
 
-    def publish(self, *args, **kwargs):
-        trace_name = "{}.{}".format(self.name, "publish")
-        child_span = self.span.make_child(trace_name)
+    def get_consumers(self, channel, queues):
+        consumer = BaseplateConsumer(
+            channel,
+            self.baseplate,
+            queues=queues,
+            callbacks=self.__callbacks)
 
-        child_span.set_tag("kind", "producer")
-        routing_key = kwargs.get("routing_key")
-        if routing_key:
-            child_span.set_tag("message_bus.destination", routing_key)
-
-        with child_span:
-            producer_pool = self.producers[self.connection]
-            with producer_pool.acquire(block=True) as producer:
-                return producer.publish(*args, **kwargs)
-
-    def publish_with_thrift_serialization(self, body, *args, **kwargs):
-        serialized_body = serialize(body)
-        return self.publish(serialized_body, *args, **kwargs)
-
-    def get_channel(self):
-        return self.connection.channel()
+        return [consumer]
